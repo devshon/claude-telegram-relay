@@ -91,7 +91,7 @@ function generatePlist(opts: {
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>${HOME}/.local/bin:${HOME}/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>HOME</key>
         <string>${HOME}</string>
     </dict>
@@ -209,6 +209,10 @@ async function main() {
   console.log("");
 
   // Ensure logs directory exists
+  {
+    const { mkdirSync } = await import("fs");
+    mkdirSync(LAUNCH_AGENTS, { recursive: true }); // missing on a fresh Mac
+  }
   if (!existsSync(LOGS_DIR)) {
     const { mkdirSync } = await import("fs");
     mkdirSync(LOGS_DIR, { recursive: true });
