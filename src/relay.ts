@@ -22,6 +22,7 @@ import {
 } from "./memory.ts";
 import { Calendars } from "./calendar.ts";
 import { Mail, isEmailAddress } from "./email.ts";
+import { sendText, textAddress } from "./imessage.ts";
 import { DraftStore, extractDrafts, formatDraft, DRAFT_INSTRUCTIONS, type Draft } from "./drafts.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
@@ -660,10 +661,28 @@ bot.on("callback_query:data", async (ctx) => {
       return;
     }
 
+    const isText = /^(sms|text|imessage|message)$/.test(d.channel);
+    const addr = isText ? textAddress(d.recipient) : null;
+    if (isText && addr && process.platform === "darwin") {
+      try {
+        // Sends exactly the stored, approved text. No AI involved.
+        const via = await sendText(addr, d.body);
+        drafts.setStatus(id, "sent");
+        await ctx.editMessageText(`SENT by ${via} to ${addr}\n\n${formatDraft(d)}`);
+      } catch (error: any) {
+        drafts.setStatus(id, "pending");
+        await ctx.editMessageText(`NOT SENT: ${error.message || error}\n\n${formatDraft(d)}`, {
+          reply_markup: draftKeyboard(id),
+        });
+      }
+      return;
+    }
+
     await ctx.editMessageText(`APPROVED\n\n${formatDraft(d)}`);
     let why = "Nothing is connected to send it yet";
     if (d.channel === "email" && !acct) why = d.account ? `No email account named "${d.account}"` : "No email account is set up";
     else if (d.channel === "email") why = `"${d.recipient}" is not a single email address`;
+    else if (isText) why = `I could not find one phone number in "${d.recipient}"`;
     await ctx.reply(`Approved. ${why}, so copy and send this yourself:\n\n${d.body}`);
   } else if (action === "reject") {
     drafts.setStatus(id, "rejected");

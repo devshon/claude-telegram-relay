@@ -110,7 +110,8 @@ cat > "$WORK_DIR/.claude/settings.json" <<'EOF'
       "Read(~/.zshrc)",
       "Read(~/claude-telegram-relay/.env)",
       "Bash(security:*)",
-      "Bash(sudo:*)"
+      "Bash(sudo:*)",
+      "Bash(osascript:*)"
     ]
   }
 }
