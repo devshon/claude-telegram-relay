@@ -19,6 +19,7 @@ import {
   getMemoryContext,
   getRelevantContext,
 } from "./memory.ts";
+import { Calendars } from "./calendar.ts";
 import { DraftStore, extractDrafts, formatDraft, DRAFT_INSTRUCTIONS, type Draft } from "./drafts.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
@@ -183,6 +184,20 @@ await mkdir(UPLOADS_DIR, { recursive: true });
 
 const memory = new LocalMemory(MEMORY_DB);
 const drafts = new DraftStore(memory.database);
+const calendars = new Calendars(RELAY_DIR, process.env.USER_TIMEZONE || Intl.DateTimeFormat().resolvedOptions().timeZone);
+
+/** Next 7 days of events for the prompt, or "" when no calendars are set up. */
+async function getCalendarContext(): Promise<string> {
+  if (!calendars.list().length) return "";
+  try {
+    const { events, errors } = await calendars.events(calendars.dayStart(0), calendars.dayStart(7));
+    const err = errors.length ? `\n(Could not read: ${errors.join("; ")})` : "";
+    return `CALENDAR, NEXT 7 DAYS (read-only; you cannot add or change events):\n${calendars.format(events)}${err}`;
+  } catch (error) {
+    console.error("Calendar context error:", error);
+    return "";
+  }
+}
 
 // Draft currently being edited: the owner's next text message replaces its body
 let editingDraftId: number | null = null;
@@ -365,6 +380,98 @@ bot.command("restart", async (ctx) => {
   restartSoon();
 });
 
+// Calendar commands
+async function agenda(ctx: Context, fromDay: number, days: number): Promise<void> {
+  if (!calendars.list().length) {
+    await ctx.reply("No calendars yet. Add one with:\n/addcal Label https://...ics");
+    return;
+  }
+  const { events, errors } = await calendars.events(calendars.dayStart(fromDay), calendars.dayStart(fromDay + days));
+  const err = errors.length ? `\n\nCould not read: ${errors.join("; ")}` : "";
+  await sendResponse(ctx, calendars.format(events) + err);
+}
+
+bot.command("today", (ctx) => agenda(ctx, 0, 1));
+bot.command("tomorrow", (ctx) => agenda(ctx, 1, 1));
+bot.command("week", (ctx) => agenda(ctx, 0, 7));
+
+bot.command("addcal", async (ctx) => {
+  const args = (ctx.match || "").trim();
+  const m = args.match(/^(.+?)\s+(https:\/\/\S+)$/i);
+  // The link is a secret: remove it from the chat
+  await ctx.deleteMessage().catch(() => {});
+  if (!m) {
+    await ctx.reply("Use: /addcal Label https://...ics\nExample: /addcal iPhotoRealty https://calendar.google.com/...basic.ics");
+    return;
+  }
+  try {
+    calendars.add(m[1].trim(), m[2]);
+    const { events, errors } = await calendars.events(calendars.dayStart(0), calendars.dayStart(7));
+    if (errors.length) {
+      await ctx.reply(`Saved "${m[1].trim()}" to Keychain, but reading it failed: ${errors.join("; ")}`);
+    } else {
+      await ctx.reply(`Saved "${m[1].trim()}" to Keychain and deleted your message. ${events.length} events in the next 7 days. Try /today.`);
+    }
+  } catch (error: any) {
+    await ctx.reply(`Could not add calendar: ${error.message}`);
+  }
+});
+
+bot.command("removecal", async (ctx) => {
+  const label = (ctx.match || "").trim();
+  await ctx.reply(calendars.remove(label) ? `Removed "${label}".` : `No calendar named "${label}".`);
+});
+
+bot.command("calendars", async (ctx) => {
+  const list = calendars.list();
+  await ctx.reply(list.length ? list.map((c) => `- ${c.label}`).join("\n") : "No calendars yet.");
+});
+
+// Morning brief
+const BRIEF_TIME = (process.env.BRIEF_TIME || "06:30").trim(); // HH:MM local, or "off"
+const BRIEF_STATE = join(RELAY_DIR, "brief.json");
+
+async function morningBrief(): Promise<string> {
+  const [memoryContext, calendarContext] = await Promise.all([
+    getMemoryContext(memory),
+    getCalendarContext(),
+  ]);
+  const prompt = buildPrompt(
+    "Write my morning brief. Plain text, short. Sections: Today (each appointment with time; flag conflicts and back-to-back items that leave no drive time), " +
+      "Tomorrow (first appointment only), Goals (active goals with deadlines in the next 14 days). " +
+      "If a section is empty, say so in a few words. No greeting, no sign-off.",
+    "",
+    [memoryContext, calendarContext].filter(Boolean).join("\n\n")
+  );
+  return callClaude(prompt, { resume: false });
+}
+
+bot.command("brief", async (ctx) => {
+  await ctx.replyWithChatAction("typing");
+  await deliver(ctx, await morningBrief());
+});
+
+if (BRIEF_TIME !== "off") {
+  setInterval(async () => {
+    try {
+      const tz = process.env.USER_TIMEZONE || Intl.DateTimeFormat().resolvedOptions().timeZone;
+      const now = new Date();
+      const hhmm = now.toLocaleTimeString("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+      const today = new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(now);
+      // Send once a day, between BRIEF_TIME and 11:00 (so a late restart does not send at night)
+      if (hhmm < BRIEF_TIME || hhmm >= "11:00") return;
+      const last = await readFile(BRIEF_STATE, "utf-8").then((t) => JSON.parse(t).date).catch(() => "");
+      if (last === today) return;
+      await writeFile(BRIEF_STATE, JSON.stringify({ date: today }));
+      const brief = await morningBrief();
+      const { text } = extractDrafts(brief);
+      await bot.api.sendMessage(ALLOWED_USER_ID, `Morning brief\n\n${text}`);
+    } catch (error) {
+      console.error("Morning brief error:", error);
+    }
+  }, 60 * 1000);
+}
+
 // List pending drafts
 bot.command("pending", async (ctx) => {
   const list = drafts.pending();
@@ -424,12 +531,17 @@ bot.on("message:text", async (ctx) => {
   await saveMessage("user", text);
 
   // Gather context: semantic search + facts/goals
-  const [relevantContext, memoryContext] = await Promise.all([
+  const [relevantContext, memoryContext, calendarContext] = await Promise.all([
     getRelevantContext(memory, text),
     getMemoryContext(memory),
+    getCalendarContext(),
   ]);
 
-  const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext);
+  const enrichedPrompt = buildPrompt(
+    text,
+    relevantContext,
+    [memoryContext, calendarContext].filter(Boolean).join("\n\n")
+  );
   const rawResponse = await callClaude(enrichedPrompt, { resume: true });
 
   // Parse and save any memory intents, strip tags from response
@@ -467,15 +579,16 @@ bot.on("message:voice", async (ctx) => {
 
     await saveMessage("user", `[Voice ${voice.duration}s]: ${transcription}`);
 
-    const [relevantContext, memoryContext] = await Promise.all([
+    const [relevantContext, memoryContext, calendarContext] = await Promise.all([
       getRelevantContext(memory, transcription),
       getMemoryContext(memory),
+      getCalendarContext(),
     ]);
 
     const enrichedPrompt = buildPrompt(
       `[Voice message transcribed]: ${transcription}`,
       relevantContext,
-      memoryContext
+      [memoryContext, calendarContext].filter(Boolean).join("\n\n")
     );
     const rawResponse = await callClaude(enrichedPrompt, { resume: true });
     const claudeResponse = await processMemoryIntents(memory, rawResponse);
