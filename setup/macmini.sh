@@ -123,6 +123,7 @@ bun run setup:verify || true
 echo
 read -r -p "  Start the bot in the background now, and on every login? (y/n): " GO
 if [ "$GO" = "y" ] || [ "$GO" = "Y" ]; then
+  mkdir -p "$HOME/Library/LaunchAgents"
   bun run setup:launchd -- --service relay
   say "Done. Message your bot on Telegram now. It should answer within a few seconds."
 else

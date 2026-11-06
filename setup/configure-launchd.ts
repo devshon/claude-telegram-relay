@@ -209,6 +209,10 @@ async function main() {
   console.log("");
 
   // Ensure logs directory exists
+  {
+    const { mkdirSync } = await import("fs");
+    mkdirSync(LAUNCH_AGENTS, { recursive: true }); // missing on a fresh Mac
+  }
   if (!existsSync(LOGS_DIR)) {
     const { mkdirSync } = await import("fs");
     mkdirSync(LOGS_DIR, { recursive: true });
