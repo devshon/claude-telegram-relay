@@ -23,6 +23,7 @@ import {
 import { Calendars } from "./calendar.ts";
 import { Mail, isEmailAddress } from "./email.ts";
 import { DraftStore, extractDrafts, formatDraft, DRAFT_INSTRUCTIONS, type Draft } from "./drafts.ts";
+import { Topics, sessionKey, parseBinding, forBinding, type TopicBinding } from "./topics.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -91,8 +92,9 @@ const UPLOADS_DIR = join(RELAY_DIR, "uploads");
 // Session tracking for conversation continuity
 const SESSION_FILE = join(RELAY_DIR, "session.json");
 
+// One Claude conversation per chat topic (key from sessionKey)
 interface SessionState {
-  sessionId: string | null;
+  sessions: Record<string, string>;
   lastActivity: string;
 }
 
@@ -102,10 +104,16 @@ interface SessionState {
 
 async function loadSession(): Promise<SessionState> {
   try {
-    const content = await readFile(SESSION_FILE, "utf-8");
-    return JSON.parse(content);
+    const content = JSON.parse(await readFile(SESSION_FILE, "utf-8"));
+    // Older format: one sessionId for the direct chat
+    if (!content.sessions) {
+      const sessions: Record<string, string> = {};
+      if (content.sessionId) sessions[sessionKey(Number(ALLOWED_USER_ID), undefined)] = content.sessionId;
+      return { sessions, lastActivity: content.lastActivity || new Date().toISOString() };
+    }
+    return content;
   } catch {
-    return { sessionId: null, lastActivity: new Date().toISOString() };
+    return { sessions: {}, lastActivity: new Date().toISOString() };
   }
 }
 
@@ -189,6 +197,22 @@ const drafts = new DraftStore(memory.database);
 const calendars = new Calendars(RELAY_DIR, process.env.USER_TIMEZONE || Intl.DateTimeFormat().resolvedOptions().timeZone);
 const USER_TZ = process.env.USER_TIMEZONE || Intl.DateTimeFormat().resolvedOptions().timeZone;
 const mail = new Mail(RELAY_DIR, process.env.USER_TIMEZONE || Intl.DateTimeFormat().resolvedOptions().timeZone);
+const topics = new Topics(RELAY_DIR);
+
+/** Topic thread of a message, or undefined outside forum topics (direct chat, General). */
+function threadOf(ctx: Context): number | undefined {
+  const msg = ctx.msg;
+  return msg?.is_topic_message ? msg.message_thread_id : undefined;
+}
+
+/** The business this message belongs to, or null for Command. */
+function bindingOf(ctx: Context): TopicBinding | null {
+  return ctx.chat ? topics.bindingFor(ctx.chat.id, threadOf(ctx)) : null;
+}
+
+function keyOf(ctx: Context): string {
+  return sessionKey(ctx.chat?.id, threadOf(ctx));
+}
 
 /** Texts and calls copied by the hal-texts helper (the only program with Full Disk Access). */
 function textsFile(): any | null {
@@ -235,11 +259,13 @@ function getTextsContext(): string {
 }
 
 /** Unread email from the last 3 days for the prompt, or "" when no accounts are set up. */
-async function getMailContext(): Promise<string> {
-  const accounts = mail.list();
+async function getMailContext(binding: TopicBinding | null = null): Promise<string> {
+  const accounts = forBinding(mail.list(), (a) => a.label, binding);
   if (!accounts.length) return "";
   try {
-    const { items, errors } = await mail.unread(3, 15);
+    const all = await mail.unread(3, 15);
+    const items = forBinding(all.items, (m) => m.account, binding);
+    const errors = all.errors;
     const err = errors.length ? `\n(Could not read: ${errors.join("; ")})` : "";
     const names = accounts.map((a) => `${a.label} (${a.address})`).join(", ");
     return (
@@ -254,10 +280,12 @@ async function getMailContext(): Promise<string> {
 }
 
 /** Next 7 days of events for the prompt, or "" when no calendars are set up. */
-async function getCalendarContext(): Promise<string> {
+async function getCalendarContext(binding: TopicBinding | null = null): Promise<string> {
   if (!calendars.list().length) return "";
   try {
-    const { events, errors } = await calendars.events(calendars.dayStart(0), calendars.dayStart(7));
+    const all = await calendars.events(calendars.dayStart(0), calendars.dayStart(7));
+    const events = forBinding(all.events, (e) => e.calendar, binding);
+    const errors = all.errors;
     const err = errors.length ? `\n(Could not read: ${errors.join("; ")})` : "";
     return `CALENDAR, NEXT 7 DAYS (read-only; you cannot add or change events):\n${calendars.format(events)}${err}`;
   } catch (error) {
@@ -280,13 +308,26 @@ async function postDraft(ctx: Context, d: Draft): Promise<void> {
   await ctx.reply(formatDraft(d), { reply_markup: draftKeyboard(d.id) });
 }
 
+/** Post a draft card to the Approvals topic when there is one, else where the draft was made. */
+async function routeDraft(ctx: Context, d: Draft, business: string | null): Promise<void> {
+  const target = topics.approvalsTarget();
+  if (!target || topics.isApprovals(ctx.chat?.id ?? 0, threadOf(ctx))) return postDraft(ctx, d);
+  const head = business ? `[${business}] ` : "";
+  await bot.api.sendMessage(target.chatId, head + formatDraft(d), {
+    message_thread_id: target.threadId,
+    reply_markup: draftKeyboard(d.id),
+  });
+  await ctx.reply(`Draft #${d.id} is waiting in Approvals.`);
+}
+
 /** Send Claude's reply, turning any DRAFT blocks into approval cards. */
 async function deliver(ctx: Context, response: string): Promise<void> {
   const { text, drafts: found } = extractDrafts(response);
   if (text) await sendResponse(ctx, text);
+  const business = bindingOf(ctx)?.business || null;
   for (const f of found) {
     const d = drafts.add(f.channel, f.recipient, f.subject, f.body, f.account);
-    await postDraft(ctx, d);
+    await routeDraft(ctx, d, business);
   }
   if (!text && !found.length) await sendResponse(ctx, "(no reply)");
 }
@@ -317,7 +358,13 @@ bot.use(async (ctx, next) => {
   // Only the configured user may use the bot
   if (userId !== ALLOWED_USER_ID) {
     console.log(`Unauthorized: ${userId}`);
-    await ctx.reply("This bot is private.");
+    if (ctx.chat?.type === "private") await ctx.reply("This bot is private.");
+    return;
+  }
+
+  // Only direct messages and the one group Hal is bound to
+  if (ctx.chat && !topics.allowedChat(ctx.chat.id, ctx.chat.type)) {
+    console.log(`Ignoring other chat: ${ctx.chat.id}`);
     return;
   }
 
@@ -340,13 +387,15 @@ bot.use(async (ctx, next) => {
 
 async function callClaude(
   prompt: string,
-  options?: { resume?: boolean; imagePath?: string }
+  options?: { resume?: boolean; imagePath?: string; key?: string }
 ): Promise<string> {
   const args = [CLAUDE_PATH, "-p", prompt];
+  const key = options?.key || sessionKey(Number(ALLOWED_USER_ID), undefined);
+  const sessionId = session.sessions[key];
 
   // Resume previous session if available and requested
-  if (options?.resume && session.sessionId) {
-    args.push("--resume", session.sessionId);
+  if (options?.resume && sessionId) {
+    args.push("--resume", sessionId);
   }
 
   args.push("--output-format", "json");
@@ -381,8 +430,8 @@ async function callClaude(
       console.error(`Claude error (exit ${exitCode}):`, detail, "| stdout:", output.slice(0, 500));
 
       // A stale or missing session makes --resume fail; start fresh once
-      if (options?.resume && session.sessionId) {
-        session.sessionId = null;
+      if (options?.resume && sessionId) {
+        delete session.sessions[key];
         await saveSession(session);
         return callClaude(prompt, { ...options, resume: false });
       }
@@ -395,8 +444,8 @@ async function callClaude(
     try {
       const parsed = JSON.parse(output);
       if (typeof parsed.result === "string") text = parsed.result.trim();
-      if (parsed.session_id) {
-        session.sessionId = parsed.session_id;
+      if (parsed.session_id && options?.resume) {
+        session.sessions[key] = parsed.session_id;
         session.lastActivity = new Date().toISOString();
         await saveSession(session);
       }
@@ -570,6 +619,71 @@ bot.command("accounts", async (ctx) => {
   await ctx.reply(all.length ? all.join("\n") : "Nothing connected yet.");
 });
 
+// Business topics (run these inside a topic of Hal's forum group)
+function inTopic(ctx: Context): number | null {
+  if (ctx.chat?.type !== "supergroup" || threadOf(ctx) === undefined) return null;
+  return threadOf(ctx)!;
+}
+
+const TOPIC_HELP =
+  "Send this inside a topic of your Hal group (Topics turned on, Hal an admin).";
+
+bot.command("settopic", async (ctx) => {
+  const thread = inTopic(ctx);
+  if (thread === null) return void (await ctx.reply(TOPIC_HELP));
+  const b = parseBinding(ctx.match || "");
+  if (!b) {
+    await ctx.reply("Use: /settopic Business name\nOr limit its accounts: /settopic Real Estate: SWFL, SWFL Calendar\nUse Command for the main topic.");
+    return;
+  }
+  try {
+    topics.bind(ctx.chat!.id, thread, b.business, b.accounts);
+  } catch (error: any) {
+    return void (await ctx.reply(error.message));
+  }
+  const acc = b.accounts.length ? `Accounts: ${b.accounts.join(", ")}.` : "All accounts for now.";
+  const prof = topics.profile(b.business) ? "Profile loaded." : `No profile yet: send /setprofile here followed by the ${b.business} profile.`;
+  await ctx.reply(`This topic is now ${b.business}. ${acc} ${prof}`);
+});
+
+bot.command("unsettopic", async (ctx) => {
+  const thread = inTopic(ctx);
+  if (thread === null) return void (await ctx.reply(TOPIC_HELP));
+  await ctx.reply(topics.unbind(thread) ? "Topic unbound." : "This topic was not bound.");
+});
+
+bot.command("setapprovals", async (ctx) => {
+  const thread = inTopic(ctx);
+  if (thread === null) return void (await ctx.reply(TOPIC_HELP));
+  try {
+    topics.setApprovals(ctx.chat!.id, thread);
+  } catch (error: any) {
+    return void (await ctx.reply(error.message));
+  }
+  await ctx.reply("This topic is now Approvals. Every draft card will be posted here.");
+});
+
+bot.command("topics", async (ctx) => {
+  await ctx.reply(topics.list());
+});
+
+bot.command("setprofile", async (ctx) => {
+  const text = (ctx.match || "").trim();
+  const name = bindingOf(ctx)?.business || "Sean";
+  if (!text) {
+    await ctx.reply(`Use: /setprofile followed by the ${name} profile text (same message, new lines are fine).`);
+    return;
+  }
+  topics.setProfile(name, text);
+  await ctx.reply(`Saved the ${name} profile (${text.length} characters).`);
+});
+
+bot.command("profile", async (ctx) => {
+  const name = bindingOf(ctx)?.business || "Sean";
+  const p = topics.profile(name);
+  await sendResponse(ctx, p ? `${name} profile:\n\n${p}` : `No ${name} profile yet. Use /setprofile.`);
+});
+
 // Morning brief
 const BRIEF_TIME = (process.env.BRIEF_TIME || "06:30").trim(); // HH:MM local, or "off"
 const BRIEF_STATE = join(RELAY_DIR, "brief.json");
@@ -610,7 +724,9 @@ if (BRIEF_TIME !== "off") {
       await writeFile(BRIEF_STATE, JSON.stringify({ date: today }));
       const brief = await morningBrief();
       const { text } = extractDrafts(brief);
-      await bot.api.sendMessage(ALLOWED_USER_ID, `Morning brief\n\n${text}`);
+      const where = topics.commandTarget();
+      if (where) await bot.api.sendMessage(where.chatId, `Morning brief\n\n${text}`, { message_thread_id: where.threadId });
+      else await bot.api.sendMessage(ALLOWED_USER_ID, `Morning brief\n\n${text}`);
     } catch (error) {
       console.error("Morning brief error:", error);
     }
@@ -703,20 +819,22 @@ bot.on("message:text", async (ctx) => {
 
   await saveMessage("user", text);
 
-  // Gather context: semantic search + facts/goals
+  // Gather context: semantic search + facts/goals, limited to this topic's business
+  const binding = bindingOf(ctx);
   const [relevantContext, memoryContext, calendarContext, mailContext] = await Promise.all([
     getRelevantContext(memory, text),
     getMemoryContext(memory),
-    getCalendarContext(),
-    getMailContext(),
+    getCalendarContext(binding),
+    getMailContext(binding),
   ]);
 
   const enrichedPrompt = buildPrompt(
     text,
     relevantContext,
-    [memoryContext, calendarContext, mailContext, getTextsContext()].filter(Boolean).join("\n\n")
+    [memoryContext, calendarContext, mailContext, getTextsContext()].filter(Boolean).join("\n\n"),
+    binding
   );
-  const rawResponse = await callClaude(enrichedPrompt, { resume: true });
+  const rawResponse = await callClaude(enrichedPrompt, { resume: true, key: keyOf(ctx) });
 
   // Parse and save any memory intents, strip tags from response
   const response = await processMemoryIntents(memory, rawResponse);
@@ -753,19 +871,21 @@ bot.on("message:voice", async (ctx) => {
 
     await saveMessage("user", `[Voice ${voice.duration}s]: ${transcription}`);
 
+    const binding = bindingOf(ctx);
     const [relevantContext, memoryContext, calendarContext, mailContext] = await Promise.all([
       getRelevantContext(memory, transcription),
       getMemoryContext(memory),
-      getCalendarContext(),
-      getMailContext(),
+      getCalendarContext(binding),
+      getMailContext(binding),
     ]);
 
     const enrichedPrompt = buildPrompt(
       `[Voice message transcribed]: ${transcription}`,
       relevantContext,
-      [memoryContext, calendarContext, mailContext, getTextsContext()].filter(Boolean).join("\n\n")
+      [memoryContext, calendarContext, mailContext, getTextsContext()].filter(Boolean).join("\n\n"),
+      binding
     );
-    const rawResponse = await callClaude(enrichedPrompt, { resume: true });
+    const rawResponse = await callClaude(enrichedPrompt, { resume: true, key: keyOf(ctx) });
     const claudeResponse = await processMemoryIntents(memory, rawResponse);
 
     await saveMessage("assistant", claudeResponse);
@@ -803,7 +923,7 @@ bot.on("message:photo", async (ctx) => {
 
     await saveMessage("user", `[Image]: ${caption}`);
 
-    const claudeResponse = await callClaude(prompt, { resume: true });
+    const claudeResponse = await callClaude(prompt, { resume: true, key: keyOf(ctx) });
 
     // Cleanup after processing
     await unlink(filePath).catch(() => {});
@@ -840,7 +960,7 @@ bot.on("message:document", async (ctx) => {
 
     await saveMessage("user", `[Document: ${doc.file_name}]: ${caption}`);
 
-    const claudeResponse = await callClaude(prompt, { resume: true });
+    const claudeResponse = await callClaude(prompt, { resume: true, key: keyOf(ctx) });
 
     await unlink(filePath).catch(() => {});
 
@@ -871,7 +991,8 @@ const USER_TIMEZONE = process.env.USER_TIMEZONE || Intl.DateTimeFormat().resolve
 function buildPrompt(
   userMessage: string,
   relevantContext?: string,
-  memoryContext?: string
+  memoryContext?: string,
+  binding: TopicBinding | null = null
 ): string {
   const now = new Date();
   const timeStr = now.toLocaleString("en-US", {
@@ -890,7 +1011,17 @@ function buildPrompt(
 
   if (USER_NAME) parts.push(`You are speaking with ${USER_NAME}.`);
   parts.push(`Current time: ${timeStr}`);
-  if (profileContext) parts.push(`\nProfile:\n${profileContext}`);
+  const ownerProfile = topics.profile("Sean") || profileContext;
+  if (ownerProfile) parts.push(`\nProfile:\n${ownerProfile}`);
+  if (binding) {
+    parts.push(
+      `\nBUSINESS TOPIC: this conversation is the ${binding.business} topic. Work only on ${binding.business}. ` +
+        "Use only its email accounts and calendars below unless the user asks about another business. " +
+        "Draft client messages in this business's voice and send email from its account."
+    );
+    const bp = topics.profile(binding.business);
+    if (bp) parts.push(`\n${binding.business} profile:\n${bp}`);
+  }
   if (memoryContext) parts.push(`\n${memoryContext}`);
   if (relevantContext) parts.push(`\n${relevantContext}`);
 
