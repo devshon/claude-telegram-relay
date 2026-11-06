@@ -11,15 +11,51 @@ import { Bot, Context } from "grammy";
 import { spawn } from "bun";
 import { writeFile, mkdir, readFile, unlink } from "fs/promises";
 import { join, dirname } from "path";
-import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import { userInfo } from "os";
 import { transcribe } from "./transcribe.ts";
 import {
+  LocalMemory,
   processMemoryIntents,
   getMemoryContext,
   getRelevantContext,
 } from "./memory.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
+
+// ============================================================
+// SECRETS FROM MACOS KEYCHAIN
+// ============================================================
+// On macOS, secrets missing from .env are read from the login Keychain:
+//   security add-generic-password -a "$USER" -s anthropic-api-key -w
+//   security add-generic-password -a "$USER" -s telegram-bot-token -w
+// The Claude CLI child process inherits ANTHROPIC_API_KEY from this process.
+
+function readKeychain(service: string): string {
+  if (process.platform !== "darwin") return "";
+  try {
+    const proc = Bun.spawnSync([
+      "security",
+      "find-generic-password",
+      "-a",
+      process.env.USER || userInfo().username,
+      "-s",
+      service,
+      "-w",
+    ]);
+    return proc.exitCode === 0 ? proc.stdout.toString().trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+if (!process.env.ANTHROPIC_API_KEY) {
+  const key = readKeychain("anthropic-api-key");
+  if (key) process.env.ANTHROPIC_API_KEY = key;
+}
+if (!process.env.TELEGRAM_BOT_TOKEN) {
+  const token = readKeychain("telegram-bot-token");
+  if (token) process.env.TELEGRAM_BOT_TOKEN = token;
+}
 
 // ============================================================
 // CONFIGURATION
@@ -30,6 +66,19 @@ const ALLOWED_USER_ID = process.env.TELEGRAM_USER_ID || "";
 const CLAUDE_PATH = process.env.CLAUDE_PATH || "claude";
 const PROJECT_DIR = process.env.PROJECT_DIR || "";
 const RELAY_DIR = process.env.RELAY_DIR || join(process.env.HOME || "~", ".claude-relay");
+const MEMORY_DB = process.env.MEMORY_DB || join(RELAY_DIR, "memory.db");
+
+if (!BOT_TOKEN) {
+  console.error("TELEGRAM_BOT_TOKEN is not set (.env or Keychain). Exiting.");
+  process.exit(1);
+}
+if (!ALLOWED_USER_ID) {
+  console.error("TELEGRAM_USER_ID is not set. Refusing to start an open bot. Exiting.");
+  process.exit(1);
+}
+if (!process.env.ANTHROPIC_API_KEY) {
+  console.warn("ANTHROPIC_API_KEY not found in .env or Keychain; Claude will use its own login.");
+}
 
 // Directories
 const TEMP_DIR = join(RELAY_DIR, "temp");
@@ -128,30 +177,17 @@ await mkdir(TEMP_DIR, { recursive: true });
 await mkdir(UPLOADS_DIR, { recursive: true });
 
 // ============================================================
-// SUPABASE (optional — only if configured)
+// MEMORY (local SQLite)
 // ============================================================
 
-const supabase: SupabaseClient | null =
-  process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY
-    ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY)
-    : null;
+const memory = new LocalMemory(MEMORY_DB);
 
 async function saveMessage(
   role: string,
   content: string,
   metadata?: Record<string, unknown>
 ): Promise<void> {
-  if (!supabase) return;
-  try {
-    await supabase.from("messages").insert({
-      role,
-      content,
-      channel: "telegram",
-      metadata: metadata || {},
-    });
-  } catch (error) {
-    console.error("Supabase save error:", error);
-  }
+  memory.saveMessage(role, content, metadata);
 }
 
 // Acquire lock
@@ -169,8 +205,8 @@ const bot = new Bot(BOT_TOKEN);
 bot.use(async (ctx, next) => {
   const userId = ctx.from?.id.toString();
 
-  // If ALLOWED_USER_ID is set, enforce it
-  if (ALLOWED_USER_ID && userId !== ALLOWED_USER_ID) {
+  // Only the configured user may use the bot
+  if (userId !== ALLOWED_USER_ID) {
     console.log(`Unauthorized: ${userId}`);
     await ctx.reply("This bot is private.");
     return;
@@ -194,7 +230,7 @@ async function callClaude(
     args.push("--resume", session.sessionId);
   }
 
-  args.push("--output-format", "text");
+  args.push("--output-format", "json");
 
   console.log(`Calling Claude: ${prompt.substring(0, 50)}...`);
 
@@ -219,15 +255,21 @@ async function callClaude(
       return `Error: ${stderr || "Claude exited with code " + exitCode}`;
     }
 
-    // Extract session ID from output if present (for --resume)
-    const sessionMatch = output.match(/Session ID: ([a-f0-9-]+)/i);
-    if (sessionMatch) {
-      session.sessionId = sessionMatch[1];
-      session.lastActivity = new Date().toISOString();
-      await saveSession(session);
+    // JSON output carries the reply text and the session ID (for --resume)
+    let text = output.trim();
+    try {
+      const parsed = JSON.parse(output);
+      if (typeof parsed.result === "string") text = parsed.result.trim();
+      if (parsed.session_id) {
+        session.sessionId = parsed.session_id;
+        session.lastActivity = new Date().toISOString();
+        await saveSession(session);
+      }
+    } catch {
+      // Not JSON (older CLI); fall back to raw text
     }
 
-    return output.trim();
+    return text;
   } catch (error) {
     console.error("Spawn error:", error);
     return `Error: Could not run Claude CLI`;
@@ -249,15 +291,15 @@ bot.on("message:text", async (ctx) => {
 
   // Gather context: semantic search + facts/goals
   const [relevantContext, memoryContext] = await Promise.all([
-    getRelevantContext(supabase, text),
-    getMemoryContext(supabase),
+    getRelevantContext(memory, text),
+    getMemoryContext(memory),
   ]);
 
   const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext);
   const rawResponse = await callClaude(enrichedPrompt, { resume: true });
 
   // Parse and save any memory intents, strip tags from response
-  const response = await processMemoryIntents(supabase, rawResponse);
+  const response = await processMemoryIntents(memory, rawResponse);
 
   await saveMessage("assistant", response);
   await sendResponse(ctx, response);
@@ -292,8 +334,8 @@ bot.on("message:voice", async (ctx) => {
     await saveMessage("user", `[Voice ${voice.duration}s]: ${transcription}`);
 
     const [relevantContext, memoryContext] = await Promise.all([
-      getRelevantContext(supabase, transcription),
-      getMemoryContext(supabase),
+      getRelevantContext(memory, transcription),
+      getMemoryContext(memory),
     ]);
 
     const enrichedPrompt = buildPrompt(
@@ -302,7 +344,7 @@ bot.on("message:voice", async (ctx) => {
       memoryContext
     );
     const rawResponse = await callClaude(enrichedPrompt, { resume: true });
-    const claudeResponse = await processMemoryIntents(supabase, rawResponse);
+    const claudeResponse = await processMemoryIntents(memory, rawResponse);
 
     await saveMessage("assistant", claudeResponse);
     await sendResponse(ctx, claudeResponse);
@@ -344,7 +386,7 @@ bot.on("message:photo", async (ctx) => {
     // Cleanup after processing
     await unlink(filePath).catch(() => {});
 
-    const cleanResponse = await processMemoryIntents(supabase, claudeResponse);
+    const cleanResponse = await processMemoryIntents(memory, claudeResponse);
     await saveMessage("assistant", cleanResponse);
     await sendResponse(ctx, cleanResponse);
   } catch (error) {
@@ -380,7 +422,7 @@ bot.on("message:document", async (ctx) => {
 
     await unlink(filePath).catch(() => {});
 
-    const cleanResponse = await processMemoryIntents(supabase, claudeResponse);
+    const cleanResponse = await processMemoryIntents(memory, claudeResponse);
     await saveMessage("assistant", cleanResponse);
     await sendResponse(ctx, cleanResponse);
   } catch (error) {
@@ -483,7 +525,8 @@ async function sendResponse(ctx: Context, response: string): Promise<void> {
 // ============================================================
 
 console.log("Starting Claude Telegram Relay...");
-console.log(`Authorized user: ${ALLOWED_USER_ID || "ANY (not recommended)"}`);
+console.log(`Authorized user: ${ALLOWED_USER_ID}`);
+console.log(`Memory database: ${MEMORY_DB}`);
 console.log(`Project directory: ${PROJECT_DIR || "(relay working directory)"}`);
 
 bot.start({

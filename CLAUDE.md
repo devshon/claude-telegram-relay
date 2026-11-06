@@ -36,81 +36,17 @@ If this is a fresh clone, run `bun run setup` first to install dependencies and 
 
 ---
 
-## Phase 2: Database & Memory — Supabase (~12 min)
+## Phase 2: Memory (local, ~1 min)
 
-Your bot's memory lives in Supabase: conversation history, facts, goals, and semantic search.
+Memory is stored locally in a SQLite file. There is no cloud database and nothing to sign up for.
 
-### Step 1: Create Supabase Project
+1. Ask the user where data should live. Default is `~/.claude-relay`. On this machine it is `/Volumes/AgentData/relay` (an encrypted external drive).
+2. Save `RELAY_DIR` (and optionally `MEMORY_DB`) to `.env`.
+3. Store secrets in the macOS Keychain instead of `.env` where possible:
+   `security add-generic-password -a "$USER" -s anthropic-api-key -w`
+4. Do not set up Supabase, Edge Functions, or an OpenAI key.
 
-**You need from the user:**
-- Supabase Project URL
-- Supabase anon public key
-
-**What to tell them:**
-1. Go to supabase.com, create a free account
-2. Create a new project (any name, any region close to them)
-3. Wait ~2 minutes for it to provision
-4. Go to Project Settings > API
-5. Copy: Project URL and anon public key
-
-**What you do:**
-1. Save `SUPABASE_URL` and `SUPABASE_ANON_KEY` to `.env`
-
-### Step 2: Connect Supabase MCP
-
-This lets Claude Code manage the database directly — run queries, deploy functions, apply migrations.
-
-**What to tell them:**
-1. Go to supabase.com/dashboard/account/tokens
-2. Create an access token, copy it
-
-**What you do:**
-```
-claude mcp add supabase -- npx -y @supabase/mcp-server-supabase@latest --access-token ACCESS_TOKEN
-```
-
-### Step 3: Create Tables
-
-Use the Supabase MCP to run the schema:
-1. Read `db/schema.sql`
-2. Execute it via `execute_sql` (or tell the user to paste it in the SQL Editor)
-3. Run `bun run test:supabase` to verify tables exist
-
-### Step 4: Set Up Semantic Search
-
-This gives your bot real memory — it finds relevant past conversations automatically.
-
-**You need from the user:**
-- An OpenAI API key (for generating text embeddings)
-
-**What to tell them:**
-1. Go to platform.openai.com, create an account
-2. Go to API keys, create a new key, copy it
-3. The key will be stored in Supabase, not on your computer. It stays with your database.
-
-**What you do:**
-1. Deploy the embed Edge Function via Supabase MCP (`deploy_edge_function` with `supabase/functions/embed/index.ts`)
-2. Deploy the search Edge Function (`supabase/functions/search/index.ts`)
-3. Tell the user to store their OpenAI key in Supabase:
-   - Go to Supabase dashboard > Project Settings > Edge Functions
-   - Under Secrets, add: `OPENAI_API_KEY` = their key
-4. Set up database webhooks so embeddings are generated automatically:
-   - Go to Supabase dashboard > Database > Webhooks > Create webhook
-   - Name: `embed_messages`, Table: `messages`, Events: INSERT
-   - Type: Supabase Edge Function, Function: `embed`
-   - Create a second webhook: `embed_memory`, Table: `memory`, Events: INSERT
-   - Same Edge Function: `embed`
-
-### Step 5: Verify
-
-Run `bun run test:supabase` to confirm:
-- Tables exist (messages, memory, logs)
-- Edge Functions respond
-- Embedding generation works
-
-**Done when:** `bun run test:supabase` passes and a test insert into `messages` gets an embedding.
-
----
+**Done when:** `bun run setup:verify` shows the memory database as writable.
 
 ## Phase 3: Personalize (~3 min)
 

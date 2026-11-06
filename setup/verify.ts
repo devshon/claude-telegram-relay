@@ -85,27 +85,28 @@ async function main() {
     pass(`User ID: ${userId}`);
   }
 
-  // 3. Supabase
-  console.log(`\n${bold("  Supabase")}`);
-  const supaUrl = env.SUPABASE_URL || "";
-  const supaKey = env.SUPABASE_ANON_KEY || "";
+  // 3. Local memory and Keychain
+  console.log(`\n${bold("  Memory (local)")}`);
+  const relayDir = env.RELAY_DIR || join(process.env.HOME || "~", ".claude-relay");
+  const memoryDb = env.MEMORY_DB || join(relayDir, "memory.db");
+  try {
+    const { Database } = await import("bun:sqlite");
+    const { mkdirSync } = await import("fs");
+    mkdirSync(dirname(memoryDb), { recursive: true });
+    const db = new Database(memoryDb, { create: true });
+    db.exec("SELECT 1");
+    db.close();
+    pass(`Memory database: ${memoryDb}`);
+  } catch (e: any) {
+    fail(`Memory database not writable at ${memoryDb}: ${e.message}`);
+  }
 
-  if (!supaUrl || supaUrl.includes("your_")) {
-    warn("SUPABASE_URL not set (memory won't persist)");
-  } else if (!supaKey || supaKey.includes("your_")) {
-    warn("SUPABASE_ANON_KEY not set");
-  } else {
-    for (const table of ["messages", "memory", "logs"]) {
-      try {
-        const res = await fetch(`${supaUrl}/rest/v1/${table}?select=*&limit=1`, {
-          headers: { apikey: supaKey, Authorization: `Bearer ${supaKey}` },
-        });
-        res.status === 200 ? pass(`Table "${table}" OK`) : fail(`Table "${table}": ${res.status}`);
-      } catch (e: any) {
-        fail(`Supabase unreachable: ${e.message}`);
-        break;
-      }
-    }
+  if (process.platform === "darwin") {
+    const hasEnvKey = !!env.ANTHROPIC_API_KEY;
+    const kc = Bun.spawnSync(["security", "find-generic-password", "-a", process.env.USER || "", "-s", "anthropic-api-key"]);
+    if (kc.exitCode === 0) pass("Anthropic API key found in Keychain");
+    else if (hasEnvKey) warn("Anthropic API key is in .env; move it to Keychain");
+    else warn("No Anthropic API key in Keychain or .env (Claude will use its own login)");
   }
 
   // 4. Services (macOS only)

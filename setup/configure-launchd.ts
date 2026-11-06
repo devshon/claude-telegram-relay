@@ -91,7 +91,7 @@ function generatePlist(opts: {
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>${HOME}/.local/bin:${HOME}/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>HOME</key>
         <string>${HOME}</string>
     </dict>
