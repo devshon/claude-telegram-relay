@@ -251,8 +251,24 @@ async function callClaude(
     const exitCode = await proc.exited;
 
     if (exitCode !== 0) {
-      console.error("Claude error:", stderr);
-      return `Error: ${stderr || "Claude exited with code " + exitCode}`;
+      // With --output-format json, the reason is usually in stdout, not stderr
+      let detail = stderr.trim();
+      try {
+        const parsed = JSON.parse(output);
+        if (typeof parsed.result === "string" && parsed.result) detail = parsed.result;
+      } catch {
+        if (!detail) detail = output.trim();
+      }
+      console.error(`Claude error (exit ${exitCode}):`, detail, "| stdout:", output.slice(0, 500));
+
+      // A stale or missing session makes --resume fail; start fresh once
+      if (options?.resume && session.sessionId) {
+        session.sessionId = null;
+        await saveSession(session);
+        return callClaude(prompt, { ...options, resume: false });
+      }
+
+      return `Error: ${detail || "Claude exited with code " + exitCode}`;
     }
 
     // JSON output carries the reply text and the session ID (for --resume)
