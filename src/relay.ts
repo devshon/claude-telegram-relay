@@ -323,6 +323,48 @@ async function callClaude(
 // MESSAGE HANDLERS
 // ============================================================
 
+// Self-update from your GitHub fork, then restart (launchd starts it again)
+function run(cmd: string[]): { ok: boolean; out: string } {
+  const r = Bun.spawnSync(cmd, { cwd: PROJECT_ROOT, stdout: "pipe", stderr: "pipe" });
+  return { ok: r.exitCode === 0, out: (r.stdout.toString() + r.stderr.toString()).trim() };
+}
+
+function restartSoon(): void {
+  setTimeout(async () => {
+    await bot.stop();
+    process.exit(0);
+  }, 500);
+}
+
+bot.command("update", async (ctx) => {
+  const branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"]).out || "master";
+  const before = run(["git", "rev-parse", "--short", "HEAD"]).out;
+  const fetch = run(["git", "fetch", "origin", branch]);
+  if (!fetch.ok) {
+    await ctx.reply(`Update failed while fetching:\n${fetch.out.slice(0, 1500)}`);
+    return;
+  }
+  const merge = run(["git", "merge", "--ff-only", "FETCH_HEAD"]);
+  if (!merge.ok) {
+    await ctx.reply(`Update failed. Local changes may be in the way:\n${merge.out.slice(0, 1500)}`);
+    return;
+  }
+  const after = run(["git", "rev-parse", "--short", "HEAD"]).out;
+  if (before === after) {
+    await ctx.reply("Already up to date.");
+    return;
+  }
+  run([process.execPath, "install"]);
+  const log = run(["git", "log", "--oneline", `${before}..${after}`]).out;
+  await ctx.reply(`Updated ${before} to ${after}:\n${log.slice(0, 1500)}\n\nRestarting. Back in about 15 seconds.`);
+  restartSoon();
+});
+
+bot.command("restart", async (ctx) => {
+  await ctx.reply("Restarting. Back in about 15 seconds.");
+  restartSoon();
+});
+
 // List pending drafts
 bot.command("pending", async (ctx) => {
   const list = drafts.pending();
