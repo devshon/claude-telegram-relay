@@ -275,6 +275,12 @@ bot.use(async (ctx, next) => {
     return;
   }
 
+  // Phones capitalize the first letter (/Addcal): commands match in lowercase
+  const msg = ctx.message;
+  if (msg?.text?.startsWith("/")) {
+    (msg as any).text = msg.text.replace(/^\/\S+/, (c) => c.toLowerCase());
+  }
+
   await next();
 });
 
@@ -619,7 +625,8 @@ bot.on("message:text", async (ctx) => {
   // An unknown command (for example from an older Hal) can carry a secret: never pass it to Claude or save it
   if (text.startsWith("/")) {
     await ctx.deleteMessage().catch(() => {});
-    await ctx.reply("Unknown command, so I deleted it without reading it. If it is new, send /update first.");
+    const name = (text.match(/^\/[a-z0-9_]+/i) || ["/"])[0];
+    await ctx.reply(`Unknown command ${name}, so I deleted it without reading it. If it is new, send /update first.`);
     return;
   }
   console.log(`Message: ${text.substring(0, 50)}...`);
