@@ -61,6 +61,11 @@ export class LocalMemory {
     }
   }
 
+  /** Shared handle so other local stores (drafts) use the same file. */
+  get database(): Database {
+    return this.db;
+  }
+
   saveMessage(role: string, content: string, metadata?: Record<string, unknown>): void {
     try {
       this.db

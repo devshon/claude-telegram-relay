@@ -7,7 +7,7 @@
  * Run: bun run src/relay.ts
  */
 
-import { Bot, Context } from "grammy";
+import { Bot, Context, InlineKeyboard } from "grammy";
 import { spawn } from "bun";
 import { writeFile, mkdir, readFile, unlink } from "fs/promises";
 import { join, dirname } from "path";
@@ -19,6 +19,7 @@ import {
   getMemoryContext,
   getRelevantContext,
 } from "./memory.ts";
+import { DraftStore, extractDrafts, formatDraft, DRAFT_INSTRUCTIONS, type Draft } from "./drafts.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -181,6 +182,32 @@ await mkdir(UPLOADS_DIR, { recursive: true });
 // ============================================================
 
 const memory = new LocalMemory(MEMORY_DB);
+const drafts = new DraftStore(memory.database);
+
+// Draft currently being edited: the owner's next text message replaces its body
+let editingDraftId: number | null = null;
+
+function draftKeyboard(id: number): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("Approve", `d:approve:${id}`)
+    .text("Edit", `d:edit:${id}`)
+    .text("Reject", `d:reject:${id}`);
+}
+
+async function postDraft(ctx: Context, d: Draft): Promise<void> {
+  await ctx.reply(formatDraft(d), { reply_markup: draftKeyboard(d.id) });
+}
+
+/** Send Claude's reply, turning any DRAFT blocks into approval cards. */
+async function deliver(ctx: Context, response: string): Promise<void> {
+  const { text, drafts: found } = extractDrafts(response);
+  if (text) await sendResponse(ctx, text);
+  for (const f of found) {
+    const d = drafts.add(f.channel, f.recipient, f.subject, f.body);
+    await postDraft(ctx, d);
+  }
+  if (!text && !found.length) await sendResponse(ctx, "(no reply)");
+}
 
 async function saveMessage(
   role: string,
@@ -296,9 +323,58 @@ async function callClaude(
 // MESSAGE HANDLERS
 // ============================================================
 
+// List pending drafts
+bot.command("pending", async (ctx) => {
+  const list = drafts.pending();
+  if (!list.length) {
+    await ctx.reply("No drafts waiting.");
+    return;
+  }
+  for (const d of list) await postDraft(ctx, d);
+});
+
+// Approve / Edit / Reject buttons (auth middleware above already limits this to the owner)
+bot.on("callback_query:data", async (ctx) => {
+  const m = ctx.callbackQuery.data.match(/^d:(approve|edit|reject):(\d+)$/);
+  if (!m) return ctx.answerCallbackQuery();
+  const [, action, idStr] = m;
+  const id = Number(idStr);
+  const d = drafts.get(id);
+  if (!d) return ctx.answerCallbackQuery({ text: "Draft not found" });
+  if (d.status !== "pending") {
+    return ctx.answerCallbackQuery({ text: `Already ${d.status}` });
+  }
+
+  if (action === "approve") {
+    drafts.setStatus(id, "approved");
+    await ctx.answerCallbackQuery({ text: "Approved" });
+    await ctx.editMessageText(`APPROVED\n\n${formatDraft(d)}`);
+    // No sender is connected yet. Hand back the final text to send manually.
+    await ctx.reply(`Approved. Nothing is connected to send it yet, so copy and send this yourself:\n\n${d.body}`);
+  } else if (action === "reject") {
+    drafts.setStatus(id, "rejected");
+    await ctx.answerCallbackQuery({ text: "Rejected" });
+    await ctx.editMessageText(`REJECTED\n\n${formatDraft(d)}`);
+  } else {
+    editingDraftId = id;
+    await ctx.answerCallbackQuery({ text: "Send the new text" });
+    await ctx.reply(`Send the new text for draft #${id} as your next message.`);
+  }
+});
+
 // Text messages
 bot.on("message:text", async (ctx) => {
   const text = ctx.message.text;
+
+  // Finishing an edit: this message is the new draft body
+  if (editingDraftId !== null) {
+    const id = editingDraftId;
+    editingDraftId = null;
+    drafts.setBody(id, text);
+    const d = drafts.get(id);
+    if (d) await postDraft(ctx, d);
+    return;
+  }
   console.log(`Message: ${text.substring(0, 50)}...`);
 
   await ctx.replyWithChatAction("typing");
@@ -318,7 +394,7 @@ bot.on("message:text", async (ctx) => {
   const response = await processMemoryIntents(memory, rawResponse);
 
   await saveMessage("assistant", response);
-  await sendResponse(ctx, response);
+  await deliver(ctx, response);
 });
 
 // Voice messages
@@ -363,7 +439,7 @@ bot.on("message:voice", async (ctx) => {
     const claudeResponse = await processMemoryIntents(memory, rawResponse);
 
     await saveMessage("assistant", claudeResponse);
-    await sendResponse(ctx, claudeResponse);
+    await deliver(ctx, claudeResponse);
   } catch (error) {
     console.error("Voice error:", error);
     await ctx.reply("Could not process voice message. Check logs for details.");
@@ -404,7 +480,7 @@ bot.on("message:photo", async (ctx) => {
 
     const cleanResponse = await processMemoryIntents(memory, claudeResponse);
     await saveMessage("assistant", cleanResponse);
-    await sendResponse(ctx, cleanResponse);
+    await deliver(ctx, cleanResponse);
   } catch (error) {
     console.error("Image error:", error);
     await ctx.reply("Could not process image.");
@@ -440,7 +516,7 @@ bot.on("message:document", async (ctx) => {
 
     const cleanResponse = await processMemoryIntents(memory, claudeResponse);
     await saveMessage("assistant", cleanResponse);
-    await sendResponse(ctx, cleanResponse);
+    await deliver(ctx, cleanResponse);
   } catch (error) {
     console.error("Document error:", error);
     await ctx.reply("Could not process document.");
@@ -496,6 +572,8 @@ function buildPrompt(
       "\n[GOAL: goal text | DEADLINE: optional date]" +
       "\n[DONE: search text for completed goal]"
   );
+
+  parts.push(DRAFT_INSTRUCTIONS);
 
   parts.push(`\nUser: ${userMessage}`);
 
