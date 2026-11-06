@@ -615,6 +615,13 @@ bot.on("message:text", async (ctx) => {
     if (d) await postDraft(ctx, d);
     return;
   }
+
+  // An unknown command (for example from an older Hal) can carry a secret: never pass it to Claude or save it
+  if (text.startsWith("/")) {
+    await ctx.deleteMessage().catch(() => {});
+    await ctx.reply("Unknown command, so I deleted it without reading it. If it is new, send /update first.");
+    return;
+  }
   console.log(`Message: ${text.substring(0, 50)}...`);
 
   await ctx.replyWithChatAction("typing");
