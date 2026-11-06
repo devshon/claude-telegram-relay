@@ -276,9 +276,13 @@ bot.use(async (ctx, next) => {
   }
 
   // Phones capitalize the first letter (/Addcal): commands match in lowercase
+  // Pasted text can arrive formatted (for example as code) without a command entity, so add one
   const msg = ctx.message;
   if (msg?.text?.startsWith("/")) {
-    (msg as any).text = msg.text.replace(/^\/\S+/, (c) => c.toLowerCase());
+    const cmd = msg.text.match(/^\/\S+/)![0];
+    (msg as any).text = cmd.toLowerCase() + msg.text.slice(cmd.length);
+    const ents = (msg.entities || []).filter((e) => e.offset >= cmd.length);
+    (msg as any).entities = [{ type: "bot_command", offset: 0, length: cmd.length }, ...ents];
   }
 
   await next();
